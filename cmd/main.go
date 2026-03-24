@@ -4,9 +4,12 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/limiter"
+	"github.com/gofiber/fiber/v2/middleware/requestid"
 	"github.com/joho/godotenv"
 	"github.com/kaantanis/urlshortener/internal/db"
 	"github.com/kaantanis/urlshortener/internal/handler"
@@ -25,6 +28,12 @@ func main() {
 	baseURL := getEnv("BASE_URL", "http://localhost:"+port)
 	dbPath := getEnv("DB_PATH", "./data/urls.db")
 	codeLength := getIntEnv("CODE_LENGTH", 6)
+	logWorkers := getIntEnv("LOG_WORKERS", 2)
+	logQueueSize := getIntEnv("LOG_QUEUE_SIZE", 2048)
+	shortenRateLimitMax := getIntEnv("SHORTEN_RATE_LIMIT_MAX", 60)
+	redirectRateLimitMax := getIntEnv("REDIRECT_RATE_LIMIT_MAX", 600)
+	rateLimitWindowSec := getIntEnv("RATE_LIMIT_WINDOW_SEC", 60)
+	trustedProxies := getCSVEnv("TRUSTED_PROXIES")
 	env := getEnv("ENV", "development")
 
 	database, err := db.NewSQLite(dbPath)
@@ -60,7 +69,16 @@ func main() {
 		}
 	}()
 
-	urlService := service.NewURLService(urlRepo, logRepo, baseURL, codeLength)
+	urlService := service.NewURLService(
+		urlRepo,
+		logRepo,
+		baseURL,
+		codeLength,
+		logWorkers,
+		logQueueSize,
+	)
+	defer urlService.Close()
+
 	startTime := time.Now()
 
 	shortenHandler := handler.NewShortenHandler(urlService)
@@ -68,17 +86,35 @@ func main() {
 	statsHandler := handler.NewStatsHandler(urlService)
 	healthHandler := handler.NewHealthHandler(startTime)
 
+	enableTrustedProxyCheck := len(trustedProxies) > 0
 	app := fiber.New(fiber.Config{
-		AppName:     "urlshortener",
-		ProxyHeader: fiber.HeaderXForwardedFor,
+		AppName:                 "urlshortener",
+		ProxyHeader:             fiber.HeaderXForwardedFor,
+		EnableTrustedProxyCheck: enableTrustedProxyCheck,
+		TrustedProxies:          trustedProxies,
 	})
 
+	app.Use(requestid.New())
 	app.Get("/health", healthHandler.Handle)
-	app.Post("/api/shorten", shortenHandler.Handle)
+	app.Post("/api/shorten", limiter.New(limiter.Config{
+		Max:        shortenRateLimitMax,
+		Expiration: time.Duration(rateLimitWindowSec) * time.Second,
+	}), shortenHandler.Handle)
 	app.Get("/api/stats/:code", statsHandler.Handle)
-	app.Get("/:code", middleware.VisitorLogger(), redirectHandler.Handle)
+	app.Get("/:code", limiter.New(limiter.Config{
+		Max:        redirectRateLimitMax,
+		Expiration: time.Duration(rateLimitWindowSec) * time.Second,
+	}), middleware.VisitorLogger(), redirectHandler.Handle)
 
-	slog.Info("starting server", "port", port, "env", env, "base_url", baseURL)
+	slog.Info("starting server",
+		"port", port,
+		"env", env,
+		"base_url", baseURL,
+		"trusted_proxy_check", enableTrustedProxyCheck,
+		"trusted_proxies", trustedProxies,
+		"log_workers", logWorkers,
+		"log_queue_size", logQueueSize,
+	)
 	if err = app.Listen(":" + port); err != nil {
 		slog.Error("server exited with error", "error", err)
 		os.Exit(1)
@@ -104,4 +140,21 @@ func getIntEnv(key string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func getCSVEnv(key string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+
+	items := strings.Split(raw, ",")
+	proxies := make([]string, 0, len(items))
+	for _, item := range items {
+		trimmed := strings.TrimSpace(item)
+		if trimmed != "" {
+			proxies = append(proxies, trimmed)
+		}
+	}
+	return proxies
 }

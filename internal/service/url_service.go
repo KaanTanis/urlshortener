@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/kaantanis/urlshortener/internal/model"
 	"github.com/kaantanis/urlshortener/internal/repository"
@@ -20,10 +21,12 @@ var (
 )
 
 type URLService struct {
-	urlRepo  *repository.URLRepository
-	logRepo  *repository.VisitLogRepository
-	baseURL  string
-	codeSize int
+	urlRepo       *repository.URLRepository
+	logRepo       *repository.VisitLogRepository
+	baseURL       string
+	codeSize      int
+	visitLogQueue chan model.VisitLog
+	wg            sync.WaitGroup
 }
 
 func NewURLService(
@@ -31,13 +34,25 @@ func NewURLService(
 	logRepo *repository.VisitLogRepository,
 	baseURL string,
 	codeSize int,
+	logWorkers int,
+	logQueueSize int,
 ) *URLService {
-	return &URLService{
-		urlRepo:  urlRepo,
-		logRepo:  logRepo,
-		baseURL:  strings.TrimRight(baseURL, "/"),
-		codeSize: codeSize,
+	if logWorkers <= 0 {
+		logWorkers = 1
 	}
+	if logQueueSize <= 0 {
+		logQueueSize = 1024
+	}
+
+	svc := &URLService{
+		urlRepo:       urlRepo,
+		logRepo:       logRepo,
+		baseURL:       strings.TrimRight(baseURL, "/"),
+		codeSize:      codeSize,
+		visitLogQueue: make(chan model.VisitLog, logQueueSize),
+	}
+	svc.startLogWorkers(logWorkers)
+	return svc
 }
 
 func (s *URLService) ValidateOriginalURL(input string) error {
@@ -110,20 +125,20 @@ func (s *URLService) IncrementHitCount(code string) error {
 }
 
 func (s *URLService) LogVisitAsync(entry model.VisitLog) {
-	go func() {
-		if err := s.logRepo.Create(entry); err != nil {
-			slog.Error("async visit log insert failed", "code", entry.Code, "error", err)
-		}
-	}()
+	select {
+	case s.visitLogQueue <- entry:
+	default:
+		slog.Warn("visit log queue full, dropping log", "code", entry.Code)
+	}
 }
 
-func (s *URLService) GetStats(code string) (model.URL, []model.VisitLog, error) {
+func (s *URLService) GetStats(code string, limit int, offset int) (model.URL, []model.VisitLog, error) {
 	urlRow, err := s.ResolveByCode(code)
 	if err != nil {
 		return model.URL{}, nil, err
 	}
 
-	recent, err := s.logRepo.FindRecentByCode(code, 20)
+	recent, err := s.logRepo.FindRecentByCode(code, limit, offset)
 	if err != nil {
 		return model.URL{}, nil, err
 	}
@@ -133,4 +148,28 @@ func (s *URLService) GetStats(code string) (model.URL, []model.VisitLog, error) 
 
 func IsNotFoundError(err error) bool {
 	return errors.Is(err, sql.ErrNoRows)
+}
+
+func (s *URLService) Close() {
+	close(s.visitLogQueue)
+	s.wg.Wait()
+}
+
+func (s *URLService) startLogWorkers(workerCount int) {
+	for i := 0; i < workerCount; i++ {
+		s.wg.Add(1)
+		go func(workerID int) {
+			defer s.wg.Done()
+			for entry := range s.visitLogQueue {
+				if err := s.logRepo.Create(entry); err != nil {
+					slog.Error(
+						"visit log worker insert failed",
+						"worker_id", workerID,
+						"code", entry.Code,
+						"error", err,
+					)
+				}
+			}
+		}(i + 1)
+	}
 }

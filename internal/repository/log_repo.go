@@ -26,7 +26,7 @@ func NewVisitLogRepository(db *sql.DB) (*VisitLogRepository, error) {
 		FROM visit_logs
 		WHERE code = ?
 		ORDER BY id DESC
-		LIMIT ?
+		LIMIT ? OFFSET ?
 	`)
 	if err != nil {
 		_ = insertStmt.Close()
@@ -55,8 +55,8 @@ func (r *VisitLogRepository) Create(logEntry model.VisitLog) error {
 	return nil
 }
 
-func (r *VisitLogRepository) FindRecentByCode(code string, limit int) ([]model.VisitLog, error) {
-	rows, err := r.recentByCodeSt.Query(code, limit)
+func (r *VisitLogRepository) FindRecentByCode(code string, limit int, offset int) ([]model.VisitLog, error) {
+	rows, err := r.recentByCodeSt.Query(code, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("query recent visits: %w", err)
 	}
